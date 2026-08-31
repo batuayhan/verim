@@ -1,0 +1,46 @@
+# Ingest — topic'ler → normalize → MIM staging
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ingest
+spec:
+  replicas: 1
+  # dedup index ON CONFLICT tekilliği tek tüketici varsayar
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app: ingest }
+  template:
+    metadata:
+      labels: { app: ingest }
+    spec:
+      initContainers:
+        - name: wait-seed
+          image: timescale/timescaledb:2.17.2-pg17
+          env:
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef: { name: verim-secrets, key: POSTGRES_PASSWORD }
+          command:
+            - sh
+            - -c
+            - until psql -h db -U postgres -d verim_mim -tAc 'SELECT 1 FROM reporting_data LIMIT 1' >/dev/null 2>&1; do sleep 2; done
+        - name: wait-redpanda
+          image: busybox:1.36
+          command: ['sh', '-c', 'until nc -z redpanda 9092; do sleep 2; done']
+      containers:
+        - name: ingest
+          image: verim-app
+          command: ['node', 'dist/ingest/ingest-service.js']
+          env:
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: verim-secrets, key: POSTGRES_PASSWORD }
+            - name: DATABASE_URL
+              value: postgres://postgres:$(POSTGRES_PASSWORD)@db:5432/verim_mim
+            - name: KAFKA_BROKERS
+              value: redpanda:9092
+            - name: NODE_OPTIONS
+              value: --max-old-space-size=256
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { cpu: '1', memory: 320Mi }

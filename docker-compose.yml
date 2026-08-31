@@ -1,0 +1,304 @@
+# Verim — lokal/kapalı-ağ dockerize ortam (production düzeninin aynısı).
+#
+#   docker compose up -d          → http://localhost:8080 (login: hvlamd/hvlamd)
+#   IZ_SCALE=1000000 docker compose up -d --force-recreate seed   → 1M izle seed
+#
+# Servisler:
+#   db          — PostgreSQL 17 (MIM staging; veriler kalıcı volume'da)
+#   seed        — tek seferlik: MIM şeması + view'lar + deterministik veri
+#   redpanda    — mesaj omurgası (Kafka uyumlu)
+#   source-*    — kaynak simülatörleri: sensör ağı (JSON) + MIP4-IES (XML)
+#   ingest      — topic'leri tüketip MIM staging'e normalize eden servis
+#   app         — NestJS API + statik SPA (Cloud Run'daki tek-servis düzeni)
+#
+# Akış: source-* ─► redpanda ─► ingest ─► db ─► app (canlı mod)
+#
+# KAYNAK PROFİLİ (az-kaynaklı sunucuda maksimum performans): her servis
+# mem_limit + (Node) heap tavanı taşır; JVM servisleri (Neo4j/OpenSearch) küçük
+# heap'le; TimescaleDB TS_TUNE_MEMORY ile sabit bütçeye ayarlanır (host-RAM'e
+# göre şişmez). reporting_data sıkıştırılır (schema.sql), sorgular önbellekli/
+# count'suz (kod). Bütün yığın ~2.5-3GB'a sığar → 4GB sunucuda rahat çalışır.
+# İsteğe bağlı override env: DB_MEM_LIMIT, TS_TUNE_MEMORY, APP_MEM_LIMIT, APP_CPUS.
+#
+# Not: build bağlamı repo köküdür (apps/client frontend'i de derlenir);
+# compose bu dosyanın bulunduğu kökten çalıştırılır.
+
+name: verim
+
+services:
+  # TimescaleDB — Postgres superset'i (drop-in); gözlem geçmişi (reporting_data)
+  # hypertable'a dönüşür (schema.sql guard'ı extension'ı algılar). Cloud SQL'de
+  # extension yoksa aynı şema düz tablo olarak çalışır.
+  db:
+    image: timescale/timescaledb:2.17.2-pg17
+    environment:
+      POSTGRES_DB: verim_mim
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-verim-dev}
+      # timescaledb-tune'u host-RAM yerine SABİT bütçeye göre boyutlar (taze
+      # deploy'da): az-kaynaklı sunucuda shared_buffers şişmez. Daha büyük host'ta
+      # da güvenli (OS page cache + reporting_data sıkıştırması boşluğu kapatır).
+      # Var olan volume'da tune yeniden koşmaz; oradaki değerler ALTER SYSTEM ile.
+      TS_TUNE_MEMORY: ${TS_TUNE_MEMORY:-2GB}
+      TS_TUNE_NUM_CPUS: ${TS_TUNE_NUM_CPUS:-2}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres -d verim_mim']
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    mem_limit: ${DB_MEM_LIMIT:-2560m}
+    shm_size: 256m
+    restart: unless-stopped
+
+  seed:
+    build:
+      context: .
+      dockerfile: apps/server/Dockerfile
+    image: verim-app
+    command: ['node', 'dist/mim/seed.js']
+    environment:
+      DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:-verim-dev}@db:5432/verim_mim
+      IZ_SCALE: ${IZ_SCALE:-0}
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: 'no'
+
+  # Mesaj omurgası — Kafka uyumlu, tek binary (kapalı ağa uygun)
+  redpanda:
+    image: redpandadata/redpanda:v24.2.7
+    command:
+      - redpanda
+      - start
+      - --smp=1
+      - --memory=512M
+      - --overprovisioned
+      - --node-id=0
+      - --check=false
+      - --kafka-addr=PLAINTEXT://0.0.0.0:9092
+      - --advertise-kafka-addr=PLAINTEXT://redpanda:9092
+      - --set
+      - redpanda.auto_create_topics_enabled=true
+    healthcheck:
+      test: ['CMD-SHELL', 'rpk cluster health | grep -q "Healthy:.*true"']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    mem_limit: 700m
+    restart: unless-stopped
+
+  # Kaynak 1: sensör ağı — JSON gözlemleri verim.gozlemler'e yayınlar
+  source-sensor:
+    image: verim-app
+    command: ['node', 'dist/ingest/producer-sensor-sim.js']
+    environment:
+      KAFKA_BROKERS: redpanda:9092
+      TICK_MS: ${TICK_MS:-1000}
+      MOVES_PER_TICK: ${MOVES_PER_TICK:-150}
+      NODE_OPTIONS: --max-old-space-size=192
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    mem_limit: 256m
+    restart: unless-stopped
+
+  # Kaynak 2: MIP4-IES tarzı XML rapor setleri — verim.mip4ies'e yayınlar
+  source-mip4ies:
+    image: verim-app
+    command: ['node', 'dist/ingest/producer-mip4ies.js']
+    environment:
+      KAFKA_BROKERS: redpanda:9092
+      BATCH_MS: ${BATCH_MS:-3000}
+      NODE_OPTIONS: --max-old-space-size=192
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    mem_limit: 256m
+    restart: unless-stopped
+
+  # Kaynak 3: Multi-INT istihbarat füzyon hattı — SIGINT/IMINT/OSINT/HUMINT
+  # raporlarını saniyede onlarca mesaj hızında verim.istihbarat'a yayınlar;
+  # korelasyon için gözlem topic'lerine SUB olur (gerçek izlere bağlanır)
+  source-intel:
+    image: verim-app
+    command: ['node', 'dist/ingest/producer-intel.js']
+    environment:
+      KAFKA_BROKERS: redpanda:9092
+      INTEL_PER_SEC: ${INTEL_PER_SEC:-25}
+      NODE_OPTIONS: --max-old-space-size=192
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    mem_limit: 256m
+    restart: unless-stopped
+
+  # Ingest: topic'ler → normalize → MIM staging (gözlem ekle + upsert)
+  ingest:
+    image: verim-app
+    command: ['node', 'dist/ingest/ingest-service.js']
+    environment:
+      DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:-verim-dev}@db:5432/verim_mim
+      KAFKA_BROKERS: redpanda:9092
+      NODE_OPTIONS: --max-old-space-size=256
+    depends_on:
+      db:
+        condition: service_healthy
+      seed:
+        condition: service_completed_successfully
+      redpanda:
+        condition: service_healthy
+    mem_limit: 320m
+    restart: unless-stopped
+
+  # AKIL YÜRÜTME ENRICHER'ı — canlı izleri sürekli skorlar, tehdidi
+  # object_item_threat'e YAZAR (dinamik+kinetik ontoloji). app'ten bağımsız
+  # sürekli süreç; skor önceden hesaplanıp indekslenir (okuma O(1), performans).
+  reasoning:
+    image: verim-app
+    command: ['node', 'dist/reasoning/reasoning-enricher.js']
+    environment:
+      DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:-verim-dev}@db:5432/verim_mim
+      REASONING_INTERVAL_MS: ${REASONING_INTERVAL_MS:-10000}
+      REASONING_WINDOW_MIN: ${REASONING_WINDOW_MIN:-15}
+      NODE_OPTIONS: --max-old-space-size=256
+    depends_on:
+      db:
+        condition: service_healthy
+      seed:
+        condition: service_completed_successfully
+    mem_limit: 384m
+    restart: unless-stopped
+
+  # GERÇEK graf veritabanı — bağlantı analizi ağı Neo4j'de tutulur ve
+  # Cypher ile sorgulanır (bellek-içi değil). Palantir link store karşılığı.
+  graphdb:
+    image: neo4j:5-community
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-verim-graph}
+      NEO4J_server_memory_heap_max__size: 384m
+      NEO4J_server_memory_pagecache_size: 128m
+    volumes:
+      - graphdata:/data
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -qO- http://localhost:7474 >/dev/null 2>&1 || exit 1']
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    mem_limit: 640m
+    restart: unless-stopped
+
+  # Graf yükleyici — varlık ağını (düğüm+kenar) Neo4j'ye yükler (tek seferlik)
+  graph-load:
+    image: verim-app
+    command: ['node', 'dist/mim/graph-load.js']
+    environment:
+      NEO4J_URL: bolt://graphdb:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-verim-graph}
+    depends_on:
+      graphdb:
+        condition: service_healthy
+    restart: 'no'
+
+  # GERÇEK arama motoru — ontoloji nesnelerinin tam-metin indeksi (Palantir
+  # global arama karşılığı). Tek düğüm, güvenlik kapalı (kapalı iç ağ).
+  opensearch:
+    image: opensearchproject/opensearch:2.17.1
+    environment:
+      discovery.type: single-node
+      DISABLE_SECURITY_PLUGIN: 'true'
+      DISABLE_INSTALL_DEMO_CONFIG: 'true'
+      OPENSEARCH_JAVA_OPTS: -Xms384m -Xmx384m
+      bootstrap.memory_lock: 'false'
+    ulimits:
+      memlock: { soft: -1, hard: -1 }
+      nofile: { soft: 65536, hard: 65536 }
+    volumes:
+      - searchdata:/usr/share/opensearch/data
+    healthcheck:
+      test: ['CMD-SHELL', 'curl -sf http://localhost:9200/_cluster/health >/dev/null || exit 1']
+      interval: 10s
+      timeout: 5s
+      retries: 30
+    mem_limit: 960m
+    restart: unless-stopped
+
+  # Arama yükleyici — varlık nesnelerini OpenSearch'e indeksler (tek seferlik)
+  search-load:
+    image: verim-app
+    command: ['node', 'dist/search/search-load.js']
+    environment:
+      DATA_BACKEND: mim
+      DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:-verim-dev}@db:5432/verim_mim
+      OPENSEARCH_URL: http://opensearch:9200
+    depends_on:
+      db:
+        condition: service_healthy
+      seed:
+        condition: service_completed_successfully
+      opensearch:
+        condition: service_healthy
+    restart: 'no'
+
+  app:
+    image: verim-app
+    environment:
+      DATA_BACKEND: mim
+      DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:-verim-dev}@db:5432/verim_mim
+      MIP_SCAN_LIMIT: ${MIP_SCAN_LIMIT:-100000}
+      # Bağlantı grafı gerçek Neo4j'den okunur (GRAPH_BACKEND ile açık seçim —
+      # lite profilde bu ikisi verilmez → bellek-içi graf, Neo4j gerekmez)
+      GRAPH_BACKEND: neo4j
+      NEO4J_URL: bolt://graphdb:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-verim-graph}
+      # Global arama gerçek OpenSearch'ten
+      SEARCH_BACKEND: opensearch
+      OPENSEARCH_URL: http://opensearch:9200
+      # Ontoloji uzantı katmanı (Sprint 2-5): açık → aktif uzantı sürümü
+      # çekirdeğe eklenir. Kapalıyken sistem bit-değişmez.
+      ONTOLOGY_EXTENSIONS: ${ONTOLOGY_EXTENSIONS:-on}
+      # Dört-göz onay için ikinci kimlik (yükleyen ≠ onaylayan).
+      # Biçim: token:ad:rol1|rol2  (varsayılan hvlamd token'ı tüm rolleri taşır)
+      AUTH_TOKENS: ${AUTH_TOKENS:-onay-9f3a2c:onaylayici:onaylayan|admin}
+      # Verim Asistanı (AIP karşılığı) — host env'inden aktarılır; boşsa
+      # asistan otomatik devre dışı kalır, sistemin geri kalanı etkilenmez.
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ASSISTANT_MODEL: ${ASSISTANT_MODEL:-gpt-4o}
+      # Heap tavanı: board motoru MIP_SCAN_LIMIT'e (100k satır) kadar bellek-içi
+      # tarayabilir; sınır OOM host-kill'i önler, az-kaynakta öngörülebilir bütçe.
+      NODE_OPTIONS: ${APP_NODE_OPTIONS:---max-old-space-size=768}
+      PORT: 3000
+    ports:
+      - '${APP_PORT:-8080}:3000'
+    volumes:
+      - appdata:/app/.data # kayıtlı analizler (GCS yoksa dosyada)
+    depends_on:
+      db:
+        condition: service_healthy
+      seed:
+        condition: service_completed_successfully
+      graphdb:
+        condition: service_healthy
+      graph-load:
+        condition: service_completed_successfully
+      opensearch:
+        condition: service_healthy
+      search-load:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ['CMD-SHELL', 'node -e "fetch(''http://localhost:3000/'').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    mem_limit: ${APP_MEM_LIMIT:-1024m}
+    cpus: ${APP_CPUS:-2.0}
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  appdata:
+  graphdata:
+  searchdata:

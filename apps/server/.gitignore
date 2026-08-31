@@ -1,0 +1,14 @@
+# bağımlılıklar & build çıktıları — kaynak değil
+node_modules/
+dist/
+coverage/
+
+# üretilen/yerel veri
+.data/
+public/
+.DS_Store
+
+# sırlar — asla commitlenmez
+scratchpad/
+*.env
+!*.env.example

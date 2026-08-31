@@ -1,0 +1,99 @@
+# Kaynak simülatörleri — redpanda topic'lerine yayın yaparlar
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: source-sensor
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: source-sensor }
+  template:
+    metadata:
+      labels: { app: source-sensor }
+    spec:
+      initContainers:
+        - name: wait-redpanda
+          image: busybox:1.36
+          command: ['sh', '-c', 'until nc -z redpanda 9092; do sleep 2; done']
+      containers:
+        - name: source-sensor
+          image: verim-app
+          command: ['node', 'dist/ingest/producer-sensor-sim.js']
+          env:
+            - name: KAFKA_BROKERS
+              value: redpanda:9092
+            - name: TICK_MS
+              valueFrom:
+                configMapKeyRef: { name: verim-config, key: TICK_MS }
+            - name: MOVES_PER_TICK
+              valueFrom:
+                configMapKeyRef: { name: verim-config, key: MOVES_PER_TICK }
+            - name: NODE_OPTIONS
+              value: --max-old-space-size=192
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { cpu: 500m, memory: 256Mi }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: source-mip4ies
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: source-mip4ies }
+  template:
+    metadata:
+      labels: { app: source-mip4ies }
+    spec:
+      initContainers:
+        - name: wait-redpanda
+          image: busybox:1.36
+          command: ['sh', '-c', 'until nc -z redpanda 9092; do sleep 2; done']
+      containers:
+        - name: source-mip4ies
+          image: verim-app
+          command: ['node', 'dist/ingest/producer-mip4ies.js']
+          env:
+            - name: KAFKA_BROKERS
+              value: redpanda:9092
+            - name: BATCH_MS
+              valueFrom:
+                configMapKeyRef: { name: verim-config, key: BATCH_MS }
+            - name: NODE_OPTIONS
+              value: --max-old-space-size=192
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { cpu: 500m, memory: 256Mi }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: source-intel
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: source-intel }
+  template:
+    metadata:
+      labels: { app: source-intel }
+    spec:
+      initContainers:
+        - name: wait-redpanda
+          image: busybox:1.36
+          command: ['sh', '-c', 'until nc -z redpanda 9092; do sleep 2; done']
+      containers:
+        - name: source-intel
+          image: verim-app
+          command: ['node', 'dist/ingest/producer-intel.js']
+          env:
+            - name: KAFKA_BROKERS
+              value: redpanda:9092
+            - name: INTEL_PER_SEC
+              valueFrom:
+                configMapKeyRef: { name: verim-config, key: INTEL_PER_SEC }
+            - name: NODE_OPTIONS
+              value: --max-old-space-size=192
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { cpu: 500m, memory: 256Mi }

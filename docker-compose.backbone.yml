@@ -1,0 +1,61 @@
+# Bulut omurgası — prod (Cloud Run) haritasının CANLI akması için ayrı bir
+# GCE VM'inde koşan mesaj omurgası + kaynaklar + ingest. Cloud Run stateless
+# olduğundan Redpanda/üreticiler orada yaşayamaz; bu compose bir VM'de çalışır
+# ve ingest, prod'un Cloud SQL'ine yazar → prod haritası/pencereleri dolar.
+#
+# Kullanım (VM'de):
+#   DATABASE_URL=postgres://USER:PASS@CLOUD_SQL_PROXY_HOST:5432/verim_mim \
+#   IMAGE=REGION-docker.pkg.dev/PROJE/verim/app:latest \
+#   docker compose -f docker-compose.backbone.yml up -d
+#
+# Cloud SQL bağlantısı: aynı VM'de cloud-sql-proxy çalıştırın ya da özel IP
+# kullanın. Ingest DATABASE_URL üzerinden yazar; şema seed'i deploy.sh /
+# FORCE_SEED job'ıyla önceden kurulmuş olmalıdır.
+
+services:
+  redpanda:
+    image: redpandadata/redpanda:v24.2.7
+    command:
+      - redpanda start
+      - --smp=1
+      - --overprovisioned
+      - --node-id=0
+      - --kafka-addr=PLAINTEXT://0.0.0.0:9092
+      - --advertise-kafka-addr=PLAINTEXT://redpanda:9092
+    healthcheck:
+      test: ['CMD-SHELL', 'rpk cluster health | grep -q Healthy || exit 1']
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  source-sensor:
+    image: ${IMAGE:?IMAGE gerekli}
+    command: ['node', 'dist/ingest/producer-sensor-sim.js']
+    environment: { KAFKA_BROKERS: redpanda:9092, MOVES_PER_TICK: '150' }
+    depends_on: { redpanda: { condition: service_healthy } }
+    restart: unless-stopped
+
+  source-mip4ies:
+    image: ${IMAGE:?IMAGE gerekli}
+    command: ['node', 'dist/ingest/producer-mip4ies.js']
+    environment: { KAFKA_BROKERS: redpanda:9092 }
+    depends_on: { redpanda: { condition: service_healthy } }
+    restart: unless-stopped
+
+  source-intel:
+    image: ${IMAGE:?IMAGE gerekli}
+    command: ['node', 'dist/ingest/producer-intel.js']
+    environment: { KAFKA_BROKERS: redpanda:9092, INTEL_PER_SEC: '25' }
+    depends_on: { redpanda: { condition: service_healthy } }
+    restart: unless-stopped
+
+  ingest:
+    image: ${IMAGE:?IMAGE gerekli}
+    command: ['node', 'dist/ingest/ingest-service.js']
+    environment:
+      KAFKA_BROKERS: redpanda:9092
+      # Cloud SQL'e yazar (proxy ya da özel IP)
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL gerekli}
+    depends_on: { redpanda: { condition: service_healthy } }
+    restart: unless-stopped

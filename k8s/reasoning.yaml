@@ -1,0 +1,46 @@
+# Akıl yürütme enricher'ı — canlı izleri sürekli skorlar (tehdit önceden hesaplanır)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: reasoning
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app: reasoning }
+  template:
+    metadata:
+      labels: { app: reasoning }
+    spec:
+      initContainers:
+        - name: wait-seed
+          image: timescale/timescaledb:2.17.2-pg17
+          env:
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef: { name: verim-secrets, key: POSTGRES_PASSWORD }
+          command:
+            - sh
+            - -c
+            - until psql -h db -U postgres -d verim_mim -tAc 'SELECT 1 FROM reporting_data LIMIT 1' >/dev/null 2>&1; do sleep 2; done
+      containers:
+        - name: reasoning
+          image: verim-app
+          command: ['node', 'dist/reasoning/reasoning-enricher.js']
+          env:
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: verim-secrets, key: POSTGRES_PASSWORD }
+            - name: DATABASE_URL
+              value: postgres://postgres:$(POSTGRES_PASSWORD)@db:5432/verim_mim
+            - name: REASONING_INTERVAL_MS
+              valueFrom:
+                configMapKeyRef: { name: verim-config, key: REASONING_INTERVAL_MS }
+            - name: REASONING_WINDOW_MIN
+              valueFrom:
+                configMapKeyRef: { name: verim-config, key: REASONING_WINDOW_MIN }
+            - name: NODE_OPTIONS
+              value: --max-old-space-size=256
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { cpu: '1', memory: 384Mi }

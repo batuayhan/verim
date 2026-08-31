@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: verim-config
+data:
+  # Board motoru tablo-tarama tavanı (satır)
+  MIP_SCAN_LIMIT: '100000'
+  # Ontoloji uzantı katmanı (kapalıyken sistem bit-değişmez)
+  ONTOLOGY_EXTENSIONS: 'on'
+  ASSISTANT_MODEL: gpt-4o
+  # Kaynak simülatörleri
+  TICK_MS: '1000'
+  MOVES_PER_TICK: '150'
+  BATCH_MS: '3000'
+  INTEL_PER_SEC: '25'
+  # Akıl yürütme enricher'ı
+  REASONING_INTERVAL_MS: '10000'
+  REASONING_WINDOW_MIN: '15'

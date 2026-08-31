@@ -1,0 +1,116 @@
+# Verim app — NestJS API + statik SPA (tek servis)
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: appdata
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests: { storage: 1Gi }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app
+spec:
+  # .data PVC'si RWO — birden çok replika için önce GCS_BUCKET benzeri
+  # paylaşımlı kalıcılığa geçilmeli
+  replicas: 1
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app: app }
+  template:
+    metadata:
+      labels: { app: app }
+    spec:
+      initContainers:
+        - name: wait-seed
+          image: timescale/timescaledb:2.17.2-pg17
+          env:
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef: { name: verim-secrets, key: POSTGRES_PASSWORD }
+          command:
+            - sh
+            - -c
+            - until psql -h db -U postgres -d verim_mim -tAc 'SELECT 1 FROM reporting_data LIMIT 1' >/dev/null 2>&1; do sleep 2; done
+        - name: wait-graphdb
+          image: busybox:1.36
+          command: ['sh', '-c', 'until nc -z graphdb 7687; do sleep 2; done']
+        - name: wait-opensearch
+          image: busybox:1.36
+          command: ['sh', '-c', 'until wget -qO- http://opensearch:9200/_cluster/health >/dev/null 2>&1; do sleep 2; done']
+      containers:
+        - name: app
+          image: verim-app
+          env:
+            - name: DATA_BACKEND
+              value: mim
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: verim-secrets, key: POSTGRES_PASSWORD }
+            - name: DATABASE_URL
+              value: postgres://postgres:$(POSTGRES_PASSWORD)@db:5432/verim_mim
+            - name: GRAPH_BACKEND
+              value: neo4j
+            - name: NEO4J_URL
+              value: bolt://graphdb:7687
+            - name: NEO4J_USER
+              value: neo4j
+            - name: NEO4J_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: verim-secrets, key: NEO4J_PASSWORD }
+            - name: SEARCH_BACKEND
+              value: opensearch
+            - name: OPENSEARCH_URL
+              value: http://opensearch:9200
+            - name: MIP_SCAN_LIMIT
+              valueFrom:
+                configMapKeyRef: { name: verim-config, key: MIP_SCAN_LIMIT }
+            - name: ONTOLOGY_EXTENSIONS
+              valueFrom:
+                configMapKeyRef: { name: verim-config, key: ONTOLOGY_EXTENSIONS }
+            - name: AUTH_TOKENS
+              valueFrom:
+                secretKeyRef: { name: verim-secrets, key: AUTH_TOKENS }
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef: { name: verim-secrets, key: OPENAI_API_KEY }
+            - name: ASSISTANT_MODEL
+              valueFrom:
+                configMapKeyRef: { name: verim-config, key: ASSISTANT_MODEL }
+            - name: NODE_OPTIONS
+              value: --max-old-space-size=768
+            - name: PORT
+              value: '3000'
+          ports:
+            - containerPort: 3000
+          volumeMounts:
+            - name: appdata
+              mountPath: /app/.data
+          readinessProbe:
+            httpGet: { path: /, port: 3000 }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet: { path: /, port: 3000 }
+            initialDelaySeconds: 30
+            periodSeconds: 15
+          resources:
+            requests: { cpu: 500m, memory: 512Mi }
+            limits: { cpu: '2', memory: 1Gi }
+      volumes:
+        - name: appdata
+          persistentVolumeClaim:
+            claimName: appdata
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: app
+spec:
+  selector: { app: app }
+  ports:
+    - port: 80
+      targetPort: 3000

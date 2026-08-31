@@ -1,0 +1,71 @@
+# TimescaleDB — MIM staging (compose'daki db servisinin karşılığı)
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: db
+spec:
+  serviceName: db
+  replicas: 1
+  selector:
+    matchLabels: { app: db }
+  template:
+    metadata:
+      labels: { app: db }
+    spec:
+      containers:
+        - name: timescaledb
+          image: timescale/timescaledb:2.17.2-pg17
+          env:
+            - name: POSTGRES_DB
+              value: verim_mim
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: verim-secrets, key: POSTGRES_PASSWORD }
+            # timescaledb-tune sabit bütçe (host-RAM'e göre şişmez)
+            - name: TS_TUNE_MEMORY
+              value: 2GB
+            - name: TS_TUNE_NUM_CPUS
+              value: '2'
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - containerPort: 5432
+          volumeMounts:
+            - name: pgdata
+              mountPath: /var/lib/postgresql/data
+            - name: dshm
+              mountPath: /dev/shm
+          readinessProbe:
+            exec:
+              command: ['pg_isready', '-U', 'postgres', '-d', 'verim_mim']
+            periodSeconds: 3
+            timeoutSeconds: 3
+          livenessProbe:
+            exec:
+              command: ['pg_isready', '-U', 'postgres', '-d', 'verim_mim']
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 250m, memory: 1Gi }
+            limits: { cpu: '2', memory: 2560Mi }
+      volumes:
+        # compose'daki shm_size: 256m karşılığı
+        - name: dshm
+          emptyDir: { medium: Memory, sizeLimit: 256Mi }
+  volumeClaimTemplates:
+    - metadata:
+        name: pgdata
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests: { storage: 10Gi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: db
+spec:
+  selector: { app: db }
+  ports:
+    - port: 5432
+      targetPort: 5432

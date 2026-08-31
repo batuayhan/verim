@@ -1,0 +1,278 @@
+# Verim — GELİŞTİRME ortamı (hot reload + gerçek MIM backend)
+#
+#   docker compose -f docker-compose.dev.yml up -d
+#     → client (Vite HMR)  : http://localhost:5173
+#     → server (nest watch): http://localhost:3000  (Swagger /docs)
+#     → db/graf/arama gerçek servislerde, veri seed'li (MIM backend)
+#
+#   Canlı akış hattı da istenirse (redpanda + kaynak simülatörleri + ingest +
+#   reasoning — prod imajından çalışır, ilk seferde derlenir):
+#     docker compose -f docker-compose.dev.yml --profile live up -d
+#
+# Notlar:
+#   - Kaynak kod bind-mount'tur; node_modules'lar container-içi named volume'da
+#     kalır (macOS bind-mount yavaşlığı ve native modül çakışması olmaz).
+#   - Proje adı verim-dev: volume/container'lar prod compose'unkilerden ayrıdır.
+#   - Dosya izleme container'da polling ile yapılır (macOS VM'lerinde fs
+#     event'leri bind-mount'a düşmez): TSC_WATCHFILE + CHOKIDAR_USEPOLLING.
+#   - Debug için db (5432), neo4j (7474/7687) ve opensearch (9200) host'a açık
+#     (yalnız 127.0.0.1 — LAN'a kapalı; dev portları 3000/5173 de öyle).
+
+name: verim-dev
+
+services:
+  db:
+    image: timescale/timescaledb:2.17.2-pg17
+    environment:
+      POSTGRES_DB: verim_mim
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-verim-dev}
+      TS_TUNE_MEMORY: ${TS_TUNE_MEMORY:-2GB}
+      TS_TUNE_NUM_CPUS: ${TS_TUNE_NUM_CPUS:-2}
+    ports:
+      - '127.0.0.1:5432:5432'
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres -d verim_mim']
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    shm_size: 256m
+    restart: unless-stopped
+
+  seed:
+    build:
+      context: .
+      dockerfile: apps/server/Dockerfile
+    image: verim-app
+    command: ['node', 'dist/mim/seed.js']
+    environment:
+      DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:-verim-dev}@db:5432/verim_mim
+      IZ_SCALE: ${IZ_SCALE:-0}
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: 'no'
+
+  graphdb:
+    image: neo4j:5-community
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-verim-graph}
+      NEO4J_server_memory_heap_max__size: 384m
+      NEO4J_server_memory_pagecache_size: 128m
+    ports:
+      - '127.0.0.1:7474:7474'
+      - '127.0.0.1:7687:7687'
+    volumes:
+      - graphdata:/data
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -qO- http://localhost:7474 >/dev/null 2>&1 || exit 1']
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+
+  graph-load:
+    image: verim-app
+    command: ['node', 'dist/mim/graph-load.js']
+    environment:
+      NEO4J_URL: bolt://graphdb:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-verim-graph}
+    depends_on:
+      graphdb:
+        condition: service_healthy
+    restart: 'no'
+
+  opensearch:
+    image: opensearchproject/opensearch:2.17.1
+    environment:
+      discovery.type: single-node
+      DISABLE_SECURITY_PLUGIN: 'true'
+      DISABLE_INSTALL_DEMO_CONFIG: 'true'
+      OPENSEARCH_JAVA_OPTS: -Xms384m -Xmx384m
+      bootstrap.memory_lock: 'false'
+    ports:
+      - '127.0.0.1:9200:9200'
+    ulimits:
+      memlock: { soft: -1, hard: -1 }
+      nofile: { soft: 65536, hard: 65536 }
+    volumes:
+      - searchdata:/usr/share/opensearch/data
+    healthcheck:
+      test: ['CMD-SHELL', 'curl -sf http://localhost:9200/_cluster/health >/dev/null || exit 1']
+      interval: 10s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+
+  search-load:
+    image: verim-app
+    command: ['node', 'dist/search/search-load.js']
+    environment:
+      DATA_BACKEND: mim
+      DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:-verim-dev}@db:5432/verim_mim
+      OPENSEARCH_URL: http://opensearch:9200
+    depends_on:
+      db:
+        condition: service_healthy
+      seed:
+        condition: service_completed_successfully
+      opensearch:
+        condition: service_healthy
+    restart: 'no'
+
+  # ---- hot-reload uygulama süreçleri ------------------------------------------
+
+  server-dev:
+    image: node:22-slim
+    working_dir: /repo/apps/server
+    command: ['sh', '-c', 'npm install && npm run start:dev']
+    environment:
+      DATA_BACKEND: mim
+      DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:-verim-dev}@db:5432/verim_mim
+      GRAPH_BACKEND: neo4j
+      NEO4J_URL: bolt://graphdb:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-verim-graph}
+      SEARCH_BACKEND: opensearch
+      OPENSEARCH_URL: http://opensearch:9200
+      ONTOLOGY_EXTENSIONS: ${ONTOLOGY_EXTENSIONS:-on}
+      AUTH_TOKENS: ${AUTH_TOKENS:-onay-9f3a2c:onaylayici:onaylayan|admin}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ASSISTANT_MODEL: ${ASSISTANT_MODEL:-gpt-4o}
+      PORT: 3000
+      # container-içi dosya izleme (bind-mount'ta fs event'leri düşmez)
+      TSC_WATCHFILE: DynamicPriorityPolling
+      CHOKIDAR_USEPOLLING: '1'
+    ports:
+      - '127.0.0.1:3000:3000'
+    volumes:
+      - .:/repo
+      - server_node_modules:/repo/apps/server/node_modules
+    depends_on:
+      db:
+        condition: service_healthy
+      seed:
+        condition: service_completed_successfully
+      graphdb:
+        condition: service_healthy
+      graph-load:
+        condition: service_completed_successfully
+      opensearch:
+        condition: service_healthy
+      search-load:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  client-dev:
+    image: node:22-slim
+    working_dir: /repo/apps/client
+    command: ['sh', '-c', 'npm install && npm run dev -- --host 0.0.0.0']
+    environment:
+      CHOKIDAR_USEPOLLING: '1'
+    ports:
+      - '127.0.0.1:5173:5173'
+    volumes:
+      - .:/repo
+      - client_node_modules:/repo/apps/client/node_modules
+    restart: unless-stopped
+
+  # ---- canlı akış hattı (opsiyonel): --profile live ----------------------------
+
+  redpanda:
+    profiles: [live]
+    image: redpandadata/redpanda:v24.2.7
+    command:
+      - redpanda
+      - start
+      - --smp=1
+      - --memory=512M
+      - --overprovisioned
+      - --node-id=0
+      - --check=false
+      - --kafka-addr=PLAINTEXT://0.0.0.0:9092
+      - --advertise-kafka-addr=PLAINTEXT://redpanda:9092
+      - --set
+      - redpanda.auto_create_topics_enabled=true
+    healthcheck:
+      test: ['CMD-SHELL', 'rpk cluster health | grep -q "Healthy:.*true"']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  source-sensor:
+    profiles: [live]
+    image: verim-app
+    command: ['node', 'dist/ingest/producer-sensor-sim.js']
+    environment:
+      KAFKA_BROKERS: redpanda:9092
+      TICK_MS: ${TICK_MS:-1000}
+      MOVES_PER_TICK: ${MOVES_PER_TICK:-150}
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    restart: unless-stopped
+
+  source-mip4ies:
+    profiles: [live]
+    image: verim-app
+    command: ['node', 'dist/ingest/producer-mip4ies.js']
+    environment:
+      KAFKA_BROKERS: redpanda:9092
+      BATCH_MS: ${BATCH_MS:-3000}
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    restart: unless-stopped
+
+  source-intel:
+    profiles: [live]
+    image: verim-app
+    command: ['node', 'dist/ingest/producer-intel.js']
+    environment:
+      KAFKA_BROKERS: redpanda:9092
+      INTEL_PER_SEC: ${INTEL_PER_SEC:-25}
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    restart: unless-stopped
+
+  ingest:
+    profiles: [live]
+    image: verim-app
+    command: ['node', 'dist/ingest/ingest-service.js']
+    environment:
+      DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:-verim-dev}@db:5432/verim_mim
+      KAFKA_BROKERS: redpanda:9092
+    depends_on:
+      db:
+        condition: service_healthy
+      seed:
+        condition: service_completed_successfully
+      redpanda:
+        condition: service_healthy
+    restart: unless-stopped
+
+  reasoning:
+    profiles: [live]
+    image: verim-app
+    command: ['node', 'dist/reasoning/reasoning-enricher.js']
+    environment:
+      DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:-verim-dev}@db:5432/verim_mim
+      REASONING_INTERVAL_MS: ${REASONING_INTERVAL_MS:-10000}
+      REASONING_WINDOW_MIN: ${REASONING_WINDOW_MIN:-15}
+    depends_on:
+      db:
+        condition: service_healthy
+      seed:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  graphdata:
+  searchdata:
+  server_node_modules:
+  client_node_modules:

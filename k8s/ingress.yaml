@@ -1,0 +1,22 @@
+# Generic Ingress — host'u ve (gerekirse) ingressClassName'i ortamına göre değiştir.
+# Ingress controller'ı olmayan cluster'da bunun yerine port-forward da yeter:
+#   kubectl -n verim port-forward svc/app 8080:80
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: verim
+  # annotations:
+  #   cert-manager.io/cluster-issuer: letsencrypt
+spec:
+  # ingressClassName: nginx
+  rules:
+    - host: verim.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: app
+                port:
+                  number: 80
